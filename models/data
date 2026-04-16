@@ -1,0 +1,167 @@
+import os
+import torch
+import random
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from torch.utils.data import Dataset, Sampler
+from sklearn.model_selection import train_test_split
+
+def load_splits(file_path):
+    train_ids = []
+    val_ids = []
+    test_ids = []
+    current_set = None 
+
+    with open(file_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue  
+
+            if line.startswith("identities in train set:"):
+                current_set = "train"
+            elif line.startswith("identities in validation set:"):
+                current_set = "val"
+            elif line.startswith("identities in test set:"):
+                current_set = "test"
+            else:
+                if current_set == "train":
+                    train_ids.append(line)
+                elif current_set == "val":
+                    val_ids.append(line)
+                elif current_set == "test":
+                    test_ids.append(line)
+
+    return train_ids, val_ids, test_ids
+
+
+def build_path(row):
+    base = "NVIDIA-VC-subset" if "NVIDIA-VC" in row["file name"] else "RAVDESS" if "RAVDESS" in row["file name"] else "CREMA-D"
+    generator = "facevid2vid" if "facevid2vid" in row["file name"] else "lia" if "lia" in row["file name"] else "tps"
+    return f"{base}/{generator}-generated/{row['target_id']}/{row['file_name']}"
+
+
+def load_landmark_train(
+    video_path: str,
+    num_frames: int = 71,
+) -> torch.Tensor:
+
+    npz_path = os.path.join('landmark', f"{os.path.splitext(video_path)[0]}_landmarks.npz")
+    landmark = np.load(npz_path)['data']
+    if len(landmark) <= num_frames + 4: landmark = np.tile(landmark,(2,1,1))
+    if "facevid2vid" in npz_path: landmark = landmark[1:]
+    total_frames = len(landmark)
+    assert num_frames + 4 <= total_frames, '{} total frames is wrong : {}'.format(npz_path, total_frames)
+    end_indice = np.random.choice(np.arange(num_frames + 4, total_frames + 1))
+    frame_indices = list(range(end_indice-num_frames - 4, end_indice))
+    data = landmark[frame_indices]
+    total_frames = len(data)
+    data[np.any((data < 0) | (data > 256), axis=(1, 2))] = 0
+    assert num_frames + 4 <= total_frames, '{} total frames is wrong : {}'.format(npz_path, total_frames)
+    return torch.Tensor(data)
+
+def load_landmark_test(
+    video_path: str,
+    num_frames: int = 71,
+) -> torch.Tensor:
+    npz_path = os.path.join('landmark', f"{os.path.splitext(video_path)[0]}_landmarks.npz")
+    landmark = np.load(npz_path)['data']
+    if len(landmark) <= num_frames + 4: landmark = np.tile(landmark,(2,1,1))
+    if "facevid2vid" in npz_path: landmark = landmark[1:]
+    total_frames = len(landmark)
+    assert num_frames + 4 <= total_frames, '{} total frames is wrong : {}'.format(npz_path, total_frames)
+    data = landmark
+    data[np.any((data < 0) | (data > 256), axis=(1, 2))] = 0
+    return torch.Tensor(data)
+
+
+class NVFAIRDataset(Dataset):
+    def __init__(self, file_list, ids, mode):
+        self.file_list = file_list
+        self.ids = ids
+        self.mode = mode
+        self.file_groups = file_list.groupby(["driving identity", "target identity"])
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        video_path = self.file_list["file name"][idx]
+        if self.mode == 'train': landmark = load_landmark_train(video_path)
+        elif self.mode == 'test': landmark = load_landmark_test(video_path)
+        return {
+            "landmark": landmark,
+            "driving_id": self.file_list["driving identity"][idx],
+            "target_id": self.file_list["target identity"][idx],
+            "video": video_path
+        }
+
+class ContrastiveSampler(Sampler):
+    def __init__(self, dataset, batch_ids=6, num_video=6):
+        self.dataset = dataset
+        self.batch_ids = batch_ids
+        self.num_video = num_video 
+
+    def __iter__(self):
+        while True:
+            selected_ids = random.sample(self.dataset.ids, self.batch_ids)
+            yield from self._sample_videos(selected_ids, self.num_video)
+
+    def _sample_videos(self, selected_ids, num):
+        df = self.dataset.file_groups.groups
+        videos = []
+        for driving_id in selected_ids:
+            for target_ids in selected_ids:
+                subdf = df[(driving_id, target_ids)]
+                indexes = subdf.tolist()
+
+                num_v = num + int(driving_id == target_ids)
+                assert len(indexes) > 0, '{} is wrong : {}'.format(driving_id, len(indexes))
+                while len(indexes) < num_v: indexes = indexes + indexes
+                videos = videos + random.sample(indexes, num_v)
+
+        return videos
+
+def collate_fn(batch):
+    landmarks = []
+    driving_ids = []
+    target_ids = []
+    for item in batch:
+        landmarks.append(item["landmark"])
+        driving_ids.append(item["driving_id"])
+        target_ids.append(item["target_id"])
+    return torch.stack(landmarks), driving_ids, target_ids
+
+def extract_identities(file_names):
+    driving_identities = []
+    for name in file_names:
+        name = name.replace(".mp4", "")
+        parts = name.split("--") 
+        if len(parts) >= 2:
+            driving_identity = parts[-1]
+        else:
+            driving_identity = None  
+        driving_identities.append(driving_identity)
+
+    return driving_identities
+
+def split_dataset(meta_df, splits, generator):
+    train_ids = splits["train"]
+    val_ids = splits["val"]
+    test_ids = splits["test"]
+
+
+    train_files = meta_df[(meta_df['driving identity'].isin(train_ids)) & (meta_df['target identity'].isin(train_ids)) & (meta_df['generator'] == generator)]
+    val_files = meta_df[(meta_df['driving identity'].isin(val_ids)) & (meta_df['target identity'].isin(val_ids)) & (meta_df['generator'] == generator)]
+    test_files = meta_df[(meta_df['driving identity'].isin(test_ids)) & (meta_df['target identity'].isin(test_ids)) & (meta_df['generator'] == generator)]
+
+    train_files = train_files.reset_index(drop=True)
+    val_files = val_files.reset_index(drop=True)
+    test_files = test_files.reset_index(drop=True)
+
+    print('Training set:', len(train_files))
+    print('Validation set:', len(val_files))
+    print('Testing set:', len(test_files))
+
+    return train_files, val_files, test_files
